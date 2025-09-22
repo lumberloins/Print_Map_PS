@@ -1,137 +1,179 @@
 #This Powershell script will map printers locally to both VPSX spoolers via LPR
 #Mappings should include LRP ports to both VPSX spoolers using port pooling for redundancy
 
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
+# Global Variables
+$global:PrinterCaption = ""
+$global:Computer = ""
+$global:COMPUTERS = ""
+$global:DriverName = ""
+$global:DriverPath = ""
+$global:DriverInf = ""
 
-# Create the form
-$form = New-Object System.Windows.Forms.Form
-$form.Text = "Printer Mapper - LPR (Pooled)"
-$form.Size = New-Object System.Drawing.Size(400, 400)
-$form.StartPosition = "CenterScreen"
+# Driver Configuration
+$DriverName = "Xerox Global Print Driver PCL6"
+$DriverPath = "C:\Windows\System32\DriverStore\FileRepository\xerox_versalink_b600_b605_b610_b615_pcl6.inf_amd64_222cd7e394115a07\"
+$DriverInf = "C:\Windows\System32\DriverStore\FileRepository\sfwemenu.inf_amd64_9a84be23a5070548\Xerox_VersaLink_B600_B605_B610_B615_PCL6.inf"
 
-# Label: Printer Name
-$labelPrinter = New-Object System.Windows.Forms.Label
-$labelPrinter.Text = "Enter Printer Name:"
-$labelPrinter.Location = New-Object System.Drawing.Point(20, 20)
-$labelPrinter.AutoSize = $true
-$form.Controls.Add($labelPrinter)
-
-# TextBox: Printer Name
-$textBoxPrinter = New-Object System.Windows.Forms.TextBox
-$textBoxPrinter.Location = New-Object System.Drawing.Point(20, 45)
-$textBoxPrinter.Width = 340
-$form.Controls.Add($textBoxPrinter)
-
-# GroupBox: Printer Type
-$groupBox = New-Object System.Windows.Forms.GroupBox
-$groupBox.Text = "Select Printer Type"
-$groupBox.Location = New-Object System.Drawing.Point(20, 85)
-$groupBox.Size = New-Object System.Drawing.Size(340, 70)
-$form.Controls.Add($groupBox)
-
-# Radio Buttons
-$radioXerox = New-Object System.Windows.Forms.RadioButton
-$radioXerox.Text = "Xerox"
-$radioXerox.Location = New-Object System.Drawing.Point(10, 30)
-$groupBox.Controls.Add($radioXerox)
-
-$radioHP = New-Object System.Windows.Forms.RadioButton
-$radioHP.Text = "HP"
-$radioHP.Location = New-Object System.Drawing.Point(120, 30)
-$groupBox.Controls.Add($radioHP)
-
-# Button: Create Printer
-$btnCreate = New-Object System.Windows.Forms.Button
-$btnCreate.Text = "Create Printer"
-$btnCreate.Location = New-Object System.Drawing.Point(20, 170)
-$btnCreate.Size = New-Object System.Drawing.Size(340, 35)
-$form.Controls.Add($btnCreate)
-
-# Status Output Box
-$textBoxStatus = New-Object System.Windows.Forms.TextBox
-$textBoxStatus.Location = New-Object System.Drawing.Point(20, 220)
-$textBoxStatus.Size = New-Object System.Drawing.Size(340, 120)
-$textBoxStatus.Multiline = $true
-$textBoxStatus.ScrollBars = "Vertical"
-$textBoxStatus.ReadOnly = $true
-$form.Controls.Add($textBoxStatus)
-
-# Function to log to status box
-function Write-Status {
-    param([string]$msg)
-    $textBoxStatus.AppendText("`r`n$msg")
+# Function: Create LPR Port via WMI
+Function CreateLPRPort {
+    param(
+        [string]$ComputerName,
+        [string]$PortName,
+        [string]$HostName,
+        [string]$QueueName
+    )
+    $wmi = [wmiclass]"\\$ComputerName\root\cimv2:win32_tcpipPrinterPort"
+    $wmi.psbase.scope.options.enablePrivileges = $true
+    $Port = $wmi.createInstance()
+    $Port.Name = $PortName
+    $Port.HostAddress = $HostName
+    $Port.PortNumber = 515
+    $Port.Protocol = 2   # LPR
+    $Port.SNMPEnabled = $false
+    $Port.Queue = $QueueName
+    $Port.Put() | Out-Null
 }
 
-# Button Click Event
-$btnCreate.Add_Click({
-    $PrinterBaseName = $textBoxPrinter.Text.Trim()
-    if ([string]::IsNullOrWhiteSpace($PrinterBaseName)) {
-        [System.Windows.Forms.MessageBox]::Show("Printer name cannot be empty.", "Input Error", "OK", "Error")
-        return
-    }
+# Function: Install Printer Driver via WMI
+Function InstallPrinterDriver {
+    param(
+        [string]$ComputerName,
+        [string]$DriverName,
+        [string]$DriverPath,
+        [string]$DriverInf
+    )
+    $wmi = [wmiclass]"\\$ComputerName\Root\cimv2:Win32_PrinterDriver"
+    $wmi.psbase.scope.options.enablePrivileges = $true
+    $Driver = $wmi.CreateInstance()
+    $Driver.Name = $DriverName
+    $Driver.DriverPath = $DriverPath
+    $Driver.InfName = $DriverInf
+    $wmi.AddPrinterDriver($Driver)
+    $wmi.Put() | out-null
+}
 
-    $PrinterName = "$PrinterBaseName-Pooled"
+# Function: Create Printer
+Function CreatePrinter {
+    param(
+        [string]$ComputerName,
+        [string]$PrinterName,
+        [string]$DriverName,
+        [string]$PrimaryPortName
+    )
+    $wmi = [wmiclass]"\\$ComputerName\Root\cimv2:Win32_Printer"
+    $Printer = $wmi.CreateInstance()
+    $Printer.Caption = $PrinterName
+    $Printer.DriverName = $DriverName
+    $Printer.PortName = $PrimaryPortName
+    $Printer.DeviceID = $PrinterName
+    $Printer.Put() | out-null
+}
 
-    # Determine printer type
-    if ($radioXerox.Checked) {
-        $DriverName = "Xerox Global Print Driver PCL6"
-    }
-    elseif ($radioHP.Checked) {
-        $DriverName = "HP Universal Printing PCL 6 (v6.6.0)"
+# Function: Add second port to existing printer (pooling)
+Function EnablePrinterPooling {
+    param(
+        [string]$ComputerName,
+        [string]$PrinterName,
+        [string]$AllPorts
+    )
+    Invoke-Command -ComputerName $ComputerName -ScriptBlock {
+        param($PrinterName, $AllPorts)
+        Set-Printer -Name $PrinterName -PrinterPooling $true
+        Set-Printer -Name $PrinterName -PortName $AllPorts
+    } -ArgumentList $PrinterName, $AllPorts
+}
+
+# Function: Get Computer Names from User (GUI)
+Function Get-ComputerName([string]$Message, [string]$WindowTitle, [string]$DefaultText) {
+    Add-Type -AssemblyName System.Drawing
+    Add-Type -AssemblyName System.Windows.Forms
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = $Message
+    $label.AutoSize = $true
+    $label.Location = '10,10'
+
+    $textBox = New-Object System.Windows.Forms.TextBox
+    $textBox.Location = '10,40'
+    $textBox.Size = '575,200'
+    $textBox.Multiline = $true
+    $textBox.ScrollBars = 'Both'
+    $textBox.Text = $DefaultText
+
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Text = "OK"
+    $okButton.Location = '415,250'
+    $okButton.Add_Click({ $form.Tag = $textBox.Text; $form.Close() })
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = "Cancel"
+    $cancelButton.Location = '510,250'
+    $cancelButton.Add_Click({ $form.Tag = $null; $form.Close() })
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = $WindowTitle
+    $form.Size = '610,320'
+    $form.StartPosition = "CenterScreen"
+    $form.Topmost = $True
+    $form.Controls.AddRange(@($label, $textBox, $okButton, $cancelButton))
+    $form.ShowDialog() > $null
+
+    return $form.Tag
+}
+
+# Function: Ping Test
+Function Online {
+	If (Test-Connection -ComputerName $Computer -Count 2 -BufferSize 16 -Quiet) {
+		return $true
+	}
+    else {
+		return $false
+	}
+}
+
+# Start of Script
+Clear-Host
+
+# Ask for printer name
+Write-Host "Enter the name of the printer to be installed:"
+$BasePrinterName = Read-Host
+$PrinterName = "$BasePrinterName-Pooled"
+
+# Prompt for remote computer(s)
+$COMPUTERS = Get-ComputerName -Message "Enter IS tags (one per line)" -WindowTitle "Computer(s) to receive printer $PrinterName" -DefaultText "Enter IS tags or scan them"
+$COMPUTERS = ($COMPUTERS -split '[\r\n]') | Where-Object { $_ }
+
+# Define spoolers and ports
+$Spooler1 = "trsmvpsxspl1.shcsd.sharp.com"
+$Spooler2 = "trsmvpsxspl2.shcsd.sharp.com"
+$LPRQueue = $BasePrinterName
+$Port1Name = "LPR_$BasePrinterName`_1"
+$Port2Name = "LPR_$BasePrinterName`_2"
+
+Clear-Host
+
+foreach ($Computer in $COMPUTERS) {
+    if (Online) {
+        Write-Host "[$Computer] Creating LPR ports..." -ForegroundColor Cyan
+        CreateLPRPort -ComputerName $Computer -PortName $Port1Name -HostName $Spooler1 -QueueName $LPRQueue
+        CreateLPRPort -ComputerName $Computer -PortName $Port2Name -HostName $Spooler2 -QueueName $LPRQueue
+
+        Write-Host "[$Computer] Installing driver..." -ForegroundColor Yellow
+        InstallPrinterDriver -DriverName $DriverName -DriverPath $DriverPath -DriverInf $DriverInf -ComputerName $Computer
+
+        Write-Host "[$Computer] Creating pooled printer $PrinterName..." -ForegroundColor Green
+        CreatePrinter -ComputerName $Computer -PrinterName $PrinterName -DriverName $DriverName -PrimaryPortName $Port1Name
+
+        Write-Host "[$Computer] Enabling port pooling..." -ForegroundColor Magenta
+        $AllPorts = "$Port1Name,$Port2Name"
+        EnablePrinterPooling -ComputerName $Computer -PrinterName $PrinterName -AllPorts $AllPorts
+
+        Write-Host "[$Computer] ✅ Printer $PrinterName created successfully!" -ForegroundColor White
     }
     else {
-        [System.Windows.Forms.MessageBox]::Show("Please select a printer type.", "Selection Required", "OK", "Warning")
-        return
+        Write-Warning "[$Computer] ❌ Offline or unreachable"
     }
+}
 
-    # Define LPR ports
-    $Port1Name = "LPR_$PrinterBaseName`_1"
-    $Port2Name = "LPR_$PrinterBaseName`_2"
-    $Host1 = "trsmvpsxspl1.shcsd.sharp.com"
-    $Host2 = "trsmvpsxspl2.shcsd.sharp.com"
-
-    # Function to create LPR port
-    function Create-LPRPort {
-        param([string]$PortName, [string]$Host, [string]$Queue)
-        if (-not (Get-PrinterPort -Name $PortName -ErrorAction SilentlyContinue)) {
-            Write-Status "Creating port $PortName -> $Host : $Queue"
-            Add-PrinterPort -Name $PortName `
-                            -PrinterHostAddress $Host `
-                            -PortNumber 515 `
-                            -LprQueueName $Queue `
-                            -Protocol LPR `
-                            -SNMP $false
-        } else {
-            Write-Status "Port $PortName already exists."
-        }
-    }
-
-    try {
-        # Create ports
-        Create-LPRPort -PortName $Port1Name -Host $Host1 -Queue $PrinterBaseName
-        Create-LPRPort -PortName $Port2Name -Host $Host2 -Queue $PrinterBaseName
-
-        # Check if printer exists
-        if (Get-Printer -Name $PrinterName -ErrorAction SilentlyContinue) {
-            Write-Status "Printer '$PrinterName' already exists. Aborting."
-            return
-        }
-
-        Write-Status "Creating printer '$PrinterName' with driver '$DriverName'..."
-        Add-Printer -Name $PrinterName -DriverName $DriverName -PortName $Port1Name
-
-        Set-Printer -Name $PrinterName -PrinterPooling $true
-
-        # Add second port
-        Set-Printer -Name $PrinterName -PortName "$Port1Name,$Port2Name"
-
-        Write-Status "✅ Printer '$PrinterName' created successfully with LPR pooling."
-    }
-    catch {
-        Write-Status "❌ Error: $_"
-    }
-})
-
-# Show the form
-[void]$form.ShowDialog()
+# Cleanup
+Remove-Variable -Name * -ErrorAction SilentlyContinue
